@@ -12,15 +12,21 @@ App Passwords on bsky.app), NOT your real account password.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 import time
+from pathlib import Path
 
-from atproto import Client, models, exceptions
+from atproto import Client, Session, SessionEvent, models, exceptions
 from dotenv import load_dotenv
 
 DEFAULT_SERVICE = "https://bsky.social"
+
+# Cached session tokens, re-used across runs (avoids createSession rate limits).
+# Secret like .env: listed in .gitignore; delete the file to force a fresh login.
+SESSION_PATH = Path(__file__).with_name(".bsky_session")
 
 # Bare URLs become clickable via a "link" facet in the post record.
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
@@ -76,6 +82,32 @@ def get_client(*, login: bool = True) -> Client:
     if not login:
         return client
 
+    @client.on_session_change
+    def _persist_session(event: SessionEvent, session: Session) -> None:
+        # Only the newest token pair is valid; persist it whenever it changes.
+        if event in (SessionEvent.CREATE, SessionEvent.IMPORT, SessionEvent.REFRESH):
+            try:
+                SESSION_PATH.write_text(session.export(), encoding="utf-8")
+            except OSError:
+                pass  # never let session saving break a run
+
+    # 1) Re-use a cached session when available.
+    saved = None
+    if SESSION_PATH.is_file():
+        saved = SESSION_PATH.read_text(encoding="utf-8").strip() or None
+    if saved:
+        try:
+            session = retry_transient(
+                lambda: client.login(session_string=saved), attempts=3, delay=1.5
+            )
+            print(f"Session restored for {session.handle} (DID: {session.did})")
+            return client
+        except TRANSIENT_ERRORS:
+            pass  # connection is down; password login below will surface it
+        except (exceptions.RequestErrorBase, exceptions.RequestException, ValueError):
+            SESSION_PATH.unlink(missing_ok=True)  # stale/revoked -> fresh login below
+
+    # 2) Fresh login with the app password.
     try:
         session = retry_transient(
             lambda: client.login(handle, password), attempts=5, delay=1.5
@@ -150,3 +182,81 @@ def build_reply_ref(client: Client, parent_uri: str) -> models.AppBskyFeedPost.R
         root = parent_ref
 
     return models.AppBskyFeedPost.ReplyRef(root=root, parent=parent_ref)
+
+
+def fetch_strong_ref(client: Client, post_uri: str) -> models.ComAtprotoRepoStrongRef.Main:
+    """Fetch a post and return its strong ref (uri + cid) — used for quote embeds."""
+    try:
+        resp = retry_transient(lambda: client.get_post_thread(uri=post_uri, depth=0))
+    except (exceptions.RequestException, exceptions.RequestErrorBase) as exc:
+        sys.exit(f"Could not fetch post {post_uri}: {type(exc).__name__}: {exc}")
+
+    thread = resp.thread
+    if not isinstance(thread, models.AppBskyFeedDefs.ThreadViewPost):
+        sys.exit(f"Post unavailable (deleted or blocked): {post_uri}")
+    return models.ComAtprotoRepoStrongRef.Main(uri=thread.post.uri, cid=thread.post.cid)
+
+
+MAX_IMAGES = 4
+
+
+def upload_images(
+    client: Client, paths: list[str], alt: str = ""
+) -> list[models.AppBskyEmbedImages.Image]:
+    """Upload image files and return embed Image entries (max 4 per post)."""
+    if len(paths) > MAX_IMAGES:
+        sys.exit(f"Bluesky supports at most {MAX_IMAGES} images per post.")
+    images = []
+    for i, path in enumerate(paths):
+        file = Path(path)
+        if not file.is_file():
+            sys.exit(f"Image not found: {path}")
+        blob = client.upload_blob(file.read_bytes()).blob
+        images.append(
+            models.AppBskyEmbedImages.Image(alt=alt if i == 0 else "", image=blob)
+        )
+    return images
+
+
+def send_post_with_self_label(
+    client: Client,
+    text: str,
+    *,
+    facets=None,
+    embed=None,
+    reply_to=None,
+    label: str = "bot",
+) -> "models.CreateRecordResponse":
+    """Create a post record carrying a self-label (e.g. 'bot') via createRecord.
+
+    ``send_post()`` cannot set labels, so the record is built by hand. Bluesky
+    recommends automated accounts self-label as ``bot``.
+    """
+
+    def raw(model) -> dict:
+        # pydantic models serialize $type via the by_alias flag
+        return json.loads(model.model_dump_json(by_alias=True, exclude_none=True))
+
+    record: dict = {
+        "$type": "app.bsky.feed.post",
+        "text": text,
+        "createdAt": client.get_current_time_iso(),
+        "labels": raw(
+            models.ComAtprotoLabelDefs.SelfLabels(
+                values=[models.ComAtprotoLabelDefs.SelfLabel(val=label)]
+            )
+        ),
+    }
+    if facets:
+        record["facets"] = [raw(facet) for facet in facets]
+    if embed is not None:
+        record["embed"] = raw(embed)
+    if reply_to is not None:
+        record["reply"] = raw(reply_to)
+
+    data = {
+        "repo": client.me.did,
+        "collection": "app.bsky.feed.post",
+        "record": record,
+    }
+    return retry_transient(lambda: client.com.atproto.repo.create_record(data))

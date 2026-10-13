@@ -8,10 +8,12 @@ authentication — no OAuth flow, no API key approval, just handle + password.
 
 | Tool | What it does |
 |------|--------------|
-| `post.py` | Post text, images (up to 4), replies, and multi-post threads from the CLI |
-| `scheduler.py` | Publishes queued posts at scheduled times (`posts_queue.json`) |
+| `post.py` | Post text, images, videos, quotes, replies, threads; delete posts; self-label as bot |
+| `scheduler.py` | Publishes queued posts (text/image/reply) at scheduled times (`posts_queue.json`) |
 | `monitor.py` | Polls notifications and auto-replies when your account is @mentioned |
-| `bluesky_client.py` | Shared login + helpers (link facets, reply refs) |
+| `engage.py` | Like / unlike, repost / unrepost, follow / unfollow, mute / unmute |
+| `feed.py` | Read: home timeline, post search, account feeds, profile summaries |
+| `bluesky_client.py` | Shared login (with session cache) + helpers (facets, reply refs, uploads) |
 
 ## Step 1 — Get your App Password
 
@@ -53,6 +55,18 @@ python post.py --text "Great point!" --reply at://did:plc:xxx/app.bsky.feed.post
 
 # Thread: separate posts with a blank line in a file
 python post.py --thread thread.txt
+
+# Quote a post (at:// URI or bsky.app URL)
+python post.py --text "Great take!" --quote at://did:plc:xxx/app.bsky.feed.post/3jz...
+
+# Video (mp4, processed by Bluesky's video service)
+python post.py --text "Watch this" --video clip.mp4 --video-alt "Waves at sunset"
+
+# Self-label as a bot (recommended by Bluesky for automated accounts)
+python post.py --text "beep boop" --label-bot
+
+# Delete a post you own
+python post.py --delete at://did:plc:xxx/app.bsky.feed.post/3jz...
 ```
 
 ## Step 4 — Schedule posts
@@ -61,8 +75,18 @@ Add items to `posts_queue.json` (UTC, ISO-8601):
 
 ```json
 [
-  { "text": "Good morning! ☀️", "post_at": "2026-10-12T09:00:00+00:00" },
-  { "text": "Afternoon check-in", "post_at": "2026-10-12T13:30:00+00:00" }
+  { "text": "Good morning! ☀️", "post_at": "2026-10-14T09:00:00+00:00" },
+  {
+    "text": "Afternoon photo + link https://example.com",
+    "post_at": "2026-10-14T13:30:00+00:00",
+    "image": "photo.jpg",
+    "alt": "Sunset over the bay"
+  },
+  {
+    "text": "Replying to my earlier post",
+    "post_at": "2026-10-14T15:00:00+00:00",
+    "reply": "at://did:plc:xxx/app.bsky.feed.post/3jz..."
+  }
 ]
 ```
 
@@ -87,6 +111,27 @@ It replies **only** to posts that @mention your account (official Bluesky
 guidance: bots should only interact when tagged, to avoid spam labels).
 Replies already handled are stored in `processed_mentions.json`.
 
+## Step 6 — Engage (likes, reposts, follows, mutes)
+
+```bash
+python engage.py like    at://did:plc:xxx/app.bsky.feed.post/3jz...
+python engage.py unlike  https://bsky.app/profile/handle/post/3jz...  # finds your like for you
+python engage.py repost  at://did:plc:xxx/app.bsky.feed.post/3jz...
+python engage.py follow  @someone.bsky.social
+python engage.py unfollow @someone.bsky.social                         # finds your follow record
+python engage.py mute    @someone.bsky.social
+python engage.py like <uri> --dry-run
+```
+
+## Step 7 — Read the network (timeline, search, profiles)
+
+```bash
+python feed.py timeline --limit 10
+python feed.py search "atprotocol" --limit 10
+python feed.py author @someone.bsky.social --limit 5
+python feed.py profile someone.bsky.social
+```
+
 ## Notes & limits
 
 - **Rate limits (official):** writes cost *points* — **5,000/hour and 35,000/day**
@@ -98,6 +143,9 @@ Replies already handled are stored in `processed_mentions.json`.
 - **Automatic retries:** every network call retries up to 3–5 times with backoff
   on transient errors (`NetworkError`, `InvokeTimeoutError`), so flaky
   connections won't lose a scheduled post.
+- **Sessions:** the first login saves a session token to `.bsky_session` (git-ignored,
+  secret like `.env`). Later runs restore it instantly and skip re-login; delete the
+  file to force a fresh login (e.g. after rotating the app password).
 - **Post limit:** 300 graphemes / 3000 bytes, max 4 images, threads max 30 posts.
 - **Bare URLs** in your text are made clickable automatically via link facets.
 - For production, prefer a system `cron`/`systemd` timer calling
@@ -110,4 +158,6 @@ Replies already handled are stored in `processed_mentions.json`.
 | `Authentication failed` | Check `BSKY_HANDLE` / `BSKY_APP_PASSWORD` in `.env`; regenerate the app password |
 | `Missing credentials` | Copy `.env.example` → `.env` and fill it in |
 | `Parent post is unavailable` | The `--reply` URI is wrong, deleted, or from a blocked account |
+| `No like record found` | You haven't liked/reposted that post (or it's beyond the 500 most recent) |
+| `Bad token scope` | That app password wasn't created with the "Allow access to direct messages" grant |
 | Handle not found | Use a full handle like `pybsky.bsky.social` (a bare name gets `.bsky.social` appended automatically) |

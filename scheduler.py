@@ -4,18 +4,28 @@
 Reads ``posts_queue.json`` every minute and publishes any item whose
 ``post_at`` timestamp is due.
 
-Queue item format (UTC ISO-8601 timestamps):
+Queue item format (UTC ISO-8601 timestamps; "text" or "image" required):
 
     [
       {
         "text": "Good morning! ☀️",
-        "post_at": "2026-10-12T09:00:00+00:00"
+        "post_at": "2026-10-14T09:00:00+00:00"
       },
       {
-        "text": "Second post",
-        "post_at": "2026-10-12T13:30:00+00:00"
+        "text": "With a photo and a link",
+        "post_at": "2026-10-14T13:30:00+00:00",
+        "image": "photo.jpg",
+        "alt": "Sunset over the bay"
+      },
+      {
+        "text": "Replying to my earlier post",
+        "post_at": "2026-10-14T15:00:00+00:00",
+        "reply": "at://did:plc:xxx/app.bsky.feed.post/3jz...",
+        "image": ["pic1.jpg", "pic2.jpg"]
       }
     ]
+
+"image" may be one path or a list of up to 4; "alt" applies to the first.
 
 Usage:
     python scheduler.py          # run continuously (checks every minute)
@@ -37,7 +47,15 @@ from pathlib import Path
 
 import schedule
 
-from bluesky_client import get_client, retry_transient
+from atproto import models
+
+from bluesky_client import (
+    build_link_facets,
+    build_reply_ref,
+    get_client,
+    retry_transient,
+    upload_images,
+)
 
 QUEUE_PATH = Path(__file__).with_name("posts_queue.json")
 POST_DELAY_SECONDS = 2  # small pause between posts in a batch (rate-limit friendly)
@@ -82,8 +100,8 @@ def check_queue(client, *, dry_run: bool) -> None:
     for index, item in enumerate(queue):
         if item.get("status", "pending") != "pending":
             continue
-        if not item.get("text") or not item.get("post_at"):
-            print(f"Queue item #{index}: missing 'text' or 'post_at', skipping.")
+        if not item.get("post_at") or (not item.get("text") and not item.get("image")):
+            print(f"Queue item #{index}: needs 'post_at' and either 'text' or 'image'.")
             continue
 
         due = parse_due(item["post_at"], index)
@@ -91,12 +109,36 @@ def check_queue(client, *, dry_run: bool) -> None:
             continue
 
         due_count += 1
+        text = item.get("text", "")
+        image = item.get("image")
+        image_paths = [image] if isinstance(image, str) else list(image or [])
+        alt = item.get("alt", "")
+        reply_uri = item.get("reply")
+
         if dry_run:
-            print(f"[dry-run] Due ({item['post_at']}): {item['text'][:70]!r}")
+            extra = []
+            if image_paths:
+                extra.append(f"images={len(image_paths)}")
+            if reply_uri:
+                extra.append("reply=yes")
+            suffix = (" " + " ".join(extra)) if extra else ""
+            print(f"[dry-run] Due ({item['post_at']}): {text[:70]!r}{suffix}")
             continue
 
         try:
-            ref = retry_transient(lambda: client.send_post(text=item["text"]))
+            embed = None
+            reply_ref = None
+            if image_paths:
+                embed = models.AppBskyEmbedImages.Main(
+                    images=upload_images(client, image_paths, alt)
+                )
+            if reply_uri:
+                reply_ref = build_reply_ref(client, reply_uri)
+            ref = retry_transient(
+                lambda: client.send_post(
+                    text=text, facets=build_link_facets(text), embed=embed, reply_to=reply_ref
+                )
+            )
         except Exception as exc:  # keep the queue alive on transient errors
             item["status"] = "failed"
             item["error"] = str(exc)
